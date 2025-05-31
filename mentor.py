@@ -127,14 +127,25 @@ class MultimodalMentor(nn.Module):
 
     def _initialize_knowledge(self):
         """Initialize knowledge tokens with environment-specific information"""
-        # This would be customized per environment
-        # For CartPole: physics concepts, balance strategies, etc.
         with torch.no_grad():
-            # Example: First few tokens represent physics concepts
-            self.env_knowledge[0] = torch.randn(self.hidden_dim) * 0.1  # Gravity
-            self.env_knowledge[1] = torch.randn(self.hidden_dim) * 0.1  # Momentum
-            self.env_knowledge[2] = torch.randn(self.hidden_dim) * 0.1  # Balance
-            # etc...
+            # Default initialization for all tokens
+            self.env_knowledge.data = torch.randn_like(self.env_knowledge) * 0.02
+
+            # Structured initialization based on concepts in config
+            if 'MENTOR_KNOWLEDGE_CONCEPTS' in MENTOR_CONFIG:
+                concepts = MENTOR_CONFIG['MENTOR_KNOWLEDGE_CONCEPTS']
+                for concept_name, token_indices in concepts.items():
+                    for token_idx in token_indices:
+                        if 0 <= token_idx < MENTOR_CONFIG['num_knowledge_tokens']:
+                            # Example: Give concept tokens a slightly different initialization pattern
+                            # This is still basic; a more advanced approach would use pre-trained embeddings
+                            if "physics" in concept_name:
+                                self.env_knowledge.data[token_idx] = torch.rand_like(self.env_knowledge.data[token_idx]) * 0.1 - 0.05 # Small centered rand
+                            elif "strategy" in concept_name:
+                                self.env_knowledge.data[token_idx] = torch.rand_like(self.env_knowledge.data[token_idx]) * 0.05 + 0.01 # Slightly positive biased
+                            else: # Default for other concepts
+                                self.env_knowledge.data[token_idx] = torch.randn_like(self.env_knowledge.data[token_idx]) * 0.03
+
 
     def forward(self, state: torch.Tensor, return_attention: bool = False) -> Dict[str, torch.Tensor]:
         """Forward pass with causal reasoning"""
@@ -217,12 +228,15 @@ class MultimodalMentor(nn.Module):
             # Get action sequence from planning
             plan_probs = F.softmax(planning_logits, dim=-1)
             planned_actions = torch.argmax(plan_probs, dim=-1).squeeze().cpu().numpy()
+            if planned_actions.ndim == 0: # Handle case for planning_horizon = 1 or batch_size = 1 squeezed
+                planned_actions = np.array([planned_actions.item()])
+
 
             # Predict causal effects
             causal_effects = {}
-            for action in range(self.num_actions):
-                effect = self.predict_action_effects(state, action)
-                causal_effects[f'action_{action}'] = effect.squeeze().cpu().numpy()
+            for action_idx in range(self.num_actions):
+                effect = self.predict_action_effects(state, action_idx)
+                causal_effects[f'action_{action_idx}'] = effect.squeeze().cpu().numpy()
 
             # Generate reasoning based on state analysis
             state_np = state.cpu().numpy().flatten()
@@ -232,7 +246,7 @@ class MultimodalMentor(nn.Module):
             strategy = self._determine_strategy(state_np, planned_actions)
 
             return MentorAdvice(
-                actions=planned_actions.tolist()[:3],  # Next 3 actions
+                actions=planned_actions.tolist()[:3] if planned_actions.size > 0 else [immediate_action],  # Next 3 actions or immediate
                 confidence=confidence,
                 reasoning=reasoning,
                 causal_effects={k: float(np.mean(np.abs(v))) for k, v in causal_effects.items()},
@@ -253,8 +267,10 @@ class MultimodalMentor(nn.Module):
                 reasoning.append(f"Critical: Pole tilting {'left' if angle < 0 else 'right'} at {abs(angle):.3f} rad")
 
             # Causal prediction
-            effect_strength = effects[f'action_{action}']
+            effect_values = effects.get(f'action_{action}', np.array(0.0))
+            effect_strength = float(np.mean(np.abs(effect_values)))
             reasoning.append(f"Action {action} predicted effect magnitude: {effect_strength:.3f}")
+
 
         return reasoning
 

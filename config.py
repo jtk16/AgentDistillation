@@ -32,6 +32,12 @@ MENTOR_CONFIG = {
     'dropout': 0.1,
     'learning_rate': 1e-4,
     'causal_prediction_weight': 0.3,  # For learning causal relationships
+    'MENTOR_KNOWLEDGE_CONCEPTS': { # New: Structured knowledge concepts
+        "physics_gravity": [0, 1], # token indices for gravity
+        "physics_momentum": [2, 3], # token indices for momentum
+        "balance_strategy": list(range(4, 8)), # token indices for balance
+        "critical_state_recognition": list(range(8, 12)) # token indices for critical states
+    }
 }
 
 # Student configuration
@@ -43,6 +49,7 @@ STUDENT_CONFIG = {
     'learning_rate': 3e-4,
     'entropy_coef': 0.01,
     'value_coef': 0.5,
+    'reasoning_thread_diversity_factor': 0.05 # New: Noise factor for reasoning threads
 }
 
 # Distillation configuration
