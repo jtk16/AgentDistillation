@@ -12,6 +12,8 @@ from typing import Dict, List, Any, Optional
 import argparse
 import os
 
+import torch.nn.functional as F
+
 from config import *
 from environment import create_environment, AdvancedRewardShaper
 from mentor import MultimodalMentor
@@ -19,13 +21,14 @@ from student import StudentAgent
 from distillation import DistillationTrainer
 from memory import PrioritizedReplayBuffer, TrajectoryBuffer, ExperienceCollector, compute_gae
 from utils import Logger, CurriculumScheduler, ActionProcessor, analyze_mentor_student_agreement
+from torch.distributions import Categorical
 
-# Import from mathematical_framework
-from mathematical_framework import PathwayImportanceOptimizer, CriticalPathwayAnalyzer as MathCriticalPathwayAnalyzer, \
-    InformationTheoreticAnalyzer
+# Import from mathematical_framework (MODIFIED)
+from mathematical_framework import PathwayImportanceOptimizer, \
+    InformationTheoreticAnalyzer # Removed CriticalPathwayAnalyzer here
 
 from activation_distillation import (
-    HumanDemonstrationCollector, ActivationTracker,  # CriticalPathwayAnalyzer is also here
+    HumanDemonstrationCollector, ActivationTracker, CriticalPathwayAnalyzer as MathCriticalPathwayAnalyzer, # ADDED CriticalPathwayAnalyzer and alias here
     ActivationSignatureExtractor, FocusedDistillationLoss, create_activation_based_distillation_pipeline
 )
 
@@ -607,7 +610,7 @@ class EnhancedRevolutionaryPipeline:
                     rewards=returns[batch_indices],  # PPO uses returns (target for value func)
                     advantages=advantages[batch_indices],
                     old_log_probs=batch_data['log_probs'][batch_indices],
-                    old_values=batch_data['values'][batch_indices]
+                    values=batch_data['values'][batch_indices]
                     # mentor_advice is optional and not directly used by train_step here, but by compute_distillation_loss if mentor_outputs not given
                 )
 
@@ -717,31 +720,39 @@ class EnhancedRevolutionaryPipeline:
             # and returns actions: List[List[int]] and info: List[Dict] (one per env)
 
             # Temporary fix for student.act if it doesn't fully support batch output for info part:
-            all_env_actions = []
-            all_env_info = []
+            all_env_actions = []  # This will store List[int] (actions for one env) for each environment
+            all_env_info = []  # This will store Dict (info for one env) for each environment
+
             if self.env.num_envs > 1:
                 for i in range(self.env.num_envs):
-                    single_state_tensor = current_states_tensor[i].unsqueeze(0)
-                    actions_single_env, info_single_env = self.student.act(single_state_tensor)
-                    all_env_actions.append(actions_single_env)  # actions_single_env is List[int]
-                    all_env_info.append(info_single_env)  # info_single_env is Dict
-            else:  # Single environment
-                actions_single_env, info_single_env = self.student.act(current_states_tensor)
-                all_env_actions.append(actions_single_env)
-                all_env_info.append(info_single_env)
+                    single_state_tensor = current_states_tensor[i].unsqueeze(0)  # Shape: (1, state_dim)
 
-            student_selected_actions = all_env_actions  # List[List[int]], e.g. [[0], [1]] for 2 envs
-            student_runtime_info = all_env_info  # List[Dict], one dict per env
+                    # student.act processes a batch. single_state_tensor is batch_size=1.
+                    # actions_batch_for_one_env will be List[List[int]] of length 1, e.g., [[act1, act2,...]]
+                    # info_batch_for_one_env will be List[Dict] of length 1, e.g., [{info_dict_for_this_env}]
+                    actions_batch_for_one_env, info_batch_for_one_env = self.student.act(single_state_tensor)
+
+                    # Correctly extract the single list of actions and the single info dictionary
+                    all_env_actions.append(actions_batch_for_one_env[0])  # Appends List[int]
+                    all_env_info.append(info_batch_for_one_env[0])  # Appends Dict
+            else:  # Single environment
+                # current_states_tensor is (1, state_dim)
+                # actions_batch will be List[List[int]] of length 1, e.g., [[[act1, act2]]]
+                # info_batch will be List[Dict] of length 1, e.g., [[{info_dict}]]
+                actions_batch, info_batch = self.student.act(current_states_tensor)
+                all_env_actions.append(actions_batch[0])  # Appends List[int] (actions for the single env)
+                all_env_info.append(info_batch[0])
+
+            student_selected_actions = all_env_actions  # Now correctly List[List[int]]
+            student_runtime_info = all_env_info  # Now correctly List[Dict]
 
             # === MENTOR QUERYING ===
+            # This part should now work correctly as student_runtime_info[i] will be a Dict
             mentor_advice_list = [None] * self.env.num_envs
             for i in range(self.env.num_envs):
-                if student_runtime_info[i].get('should_query_mentor', False):
+                if student_runtime_info[i].get('should_query_mentor', False):  # This line was causing the error
                     num_mentor_queries_this_rollout += 1
-                    # Mentor.get_advice expects a single state tensor (1, StateDim) or (StateDim,)
                     mentor_advice_list[i] = self._query_mentor(current_states_tensor[i].unsqueeze(0))
-                    # Optional: Analyze agreement here if needed for logging/metrics
-                    # analyze_mentor_student_agreement(...)
 
             # === ENVIRONMENT STEP ===
             # Ensure student_selected_actions is List[List[int]] for env.step
@@ -775,10 +786,13 @@ class EnhancedRevolutionaryPipeline:
             with torch.no_grad():
                 student_outputs_for_collection = self.student(current_states_tensor)
 
-            # Process primary actions for log_prob collection
             primary_actions_for_logprob = torch.tensor([sel_acts[0] for sel_acts in student_selected_actions],
                                                        dtype=torch.long, device=DEVICE)
-            dist_for_logprob = Categorical(logits=student_outputs_for_collection['primary_logits'])
+
+
+
+            dist_for_logprob = Categorical(
+                logits=student_outputs_for_collection['primary_logits'])  # This is the failing line
             log_probs_for_collection = dist_for_logprob.log_prob(primary_actions_for_logprob)
 
             values_for_collection = student_outputs_for_collection['value'].squeeze(-1)  # Ensure (N_envs,)

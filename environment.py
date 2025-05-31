@@ -10,7 +10,7 @@ import torch
 from typing import Dict, List, Tuple, Optional, Any
 from collections import deque
 
-from config import ENV_CONFIG, DEVICE
+from config import ENV_CONFIG, DEVICE, TRAINING_CONFIG
 from utils import compute_intrinsic_reward, create_env_description
 
 
