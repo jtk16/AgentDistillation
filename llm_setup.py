@@ -50,9 +50,11 @@ def install_llm_dependencies():
         "accelerate>=0.24.0",
         "bitsandbytes>=0.41.0",  # For 4-bit quantization
         "sentencepiece>=0.1.99",  # For tokenization
-        "protobuf>=3.20.0",
+        "protobuf>=3.20.0", # Often a dependency for transformers or sentencepiece
         "huggingface_hub>=0.19.0"
     ]
+
+    llm_packages = []
 
     for package in llm_packages:
         try:
@@ -64,6 +66,10 @@ def install_llm_dependencies():
         except subprocess.CalledProcessError:
             print(f"❌ Failed to install {package}")
             return False
+        except Exception as e:
+            print(f"❌ An unexpected error occurred while installing {package}: {e}")
+            return False
+
 
     return True
 
@@ -85,21 +91,24 @@ def test_llm_loading():
         {
             "name": "microsoft/Phi-3-mini-4k-instruct",
             "size": "3.8B",
-            "expected_vram": 3.5
+            "expected_vram": 3.5,
+            "attn_implementation": "eager"  # Phi-3 often more stable with eager
         },
         {
             "name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
             "size": "1.1B",
-            "expected_vram": 1.0
+            "expected_vram": 1.0,
+            "attn_implementation": "sdpa" # Default for others
         },
         {
             "name": "Qwen/Qwen2-0.5B-Instruct",
             "size": "0.5B",
-            "expected_vram": 0.6
+            "expected_vram": 0.6,
+            "attn_implementation": "sdpa"
         }
     ]
 
-    available_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    available_vram = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0
     print(f"Available VRAM: {available_vram:.1f}GB")
 
     successful_models = []
@@ -107,12 +116,17 @@ def test_llm_loading():
     for model_info in test_models:
         model_name = model_info["name"]
         expected_vram = model_info["expected_vram"]
+        attn_impl = model_info.get("attn_implementation", "sdpa")
 
-        if expected_vram > available_vram * 0.8:  # Leave 20% buffer
-            print(f"⏭️  Skipping {model_name} - requires {expected_vram:.1f}GB (insufficient VRAM)")
+
+        if not torch.cuda.is_available() and expected_vram > 0:
+             print(f"⏭️  Skipping {model_name} - CUDA not available for GPU models.")
+             continue
+        if expected_vram > available_vram * 0.9:  # Leave 10% buffer, was 0.8
+            print(f"⏭️  Skipping {model_name} - requires {expected_vram:.1f}GB (insufficient VRAM, needs > {expected_vram / 0.9:.1f}GB total with buffer)")
             continue
 
-        print(f"🔄 Testing {model_name} ({model_info['size']})...")
+        print(f"�� Testing {model_name} ({model_info['size']}) using attn_implementation='{attn_impl}'...")
 
         try:
             # Configure 4-bit quantization
@@ -128,19 +142,20 @@ def test_llm_loading():
             print(f"   ✅ Tokenizer loaded")
 
             # Test model loading with memory monitoring
-            initial_memory = torch.cuda.memory_allocated() / 1e9
+            initial_memory = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
 
             model = AutoModelForCausalLM.from_pretrained(
                 model_name,
                 quantization_config=bnb_config,
                 torch_dtype=torch.float16,
-                device_map="auto",
+                device_map="auto", # Automatically handles CPU/GPU
                 trust_remote_code=True,
-                low_cpu_mem_usage=True
+                low_cpu_mem_usage=True,
+                attn_implementation=attn_impl
             )
 
             model.eval()
-            final_memory = torch.cuda.memory_allocated() / 1e9
+            final_memory = torch.cuda.memory_allocated() / 1e9 if torch.cuda.is_available() else 0
             memory_used = final_memory - initial_memory
 
             print(f"   ✅ Model loaded successfully")
@@ -148,7 +163,10 @@ def test_llm_loading():
 
             # Test generation
             test_prompt = "The optimal action in CartPole when the pole is leaning right is:"
-            inputs = tokenizer(test_prompt, return_tensors="pt").to(model.device)
+            # Ensure model is on a device, and inputs are on that device
+            target_device = model.device if hasattr(model, 'device') else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+            inputs = tokenizer(test_prompt, return_tensors="pt").to(target_device)
+
 
             with torch.no_grad():
                 outputs = model.generate(
@@ -171,7 +189,11 @@ def test_llm_loading():
             # Cleanup
             del model
             del tokenizer
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+
 
             print(f"   ✅ {model_name} - WORKING")
             break  # Use first working model
@@ -179,7 +201,10 @@ def test_llm_loading():
         except Exception as e:
             print(f"   ❌ {model_name} failed: {e}")
             # Cleanup on failure
-            torch.cuda.empty_cache()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            import gc
+            gc.collect()
             continue
 
     if successful_models:
@@ -197,11 +222,12 @@ def create_optimized_config(recommended_model: str):
     """Create optimized configuration file"""
     print("⚙️ Creating optimized configuration...")
 
-    available_vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    available_vram = torch.cuda.get_device_properties(0).total_memory / 1e9 if torch.cuda.is_available() else 0.0
+
 
     config = {
         "# LLM-Enhanced Pipeline Configuration": "Auto-generated",
-        "device": "cuda",
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
         "recommended_llm_model": recommended_model,
         "available_vram_gb": round(available_vram, 1),
 
@@ -214,16 +240,16 @@ def create_optimized_config(recommended_model: str):
 
         "llm_config": {
             "model_name": recommended_model,
-            "use_4bit_quantization": True,
+            "use_4bit_quantization": True if torch.cuda.is_available() else False, # Only quantize on GPU
             "max_context_length": 2048 if available_vram >= 8 else 1024,
             "enable_response_cache": True,
             "query_frequency": "adaptive"
         },
 
         "memory_optimization": {
-            "enable_mixed_precision": True,
-            "gradient_checkpointing": True,
-            "memory_efficient_attention": True
+            "enable_mixed_precision": True if torch.cuda.is_available() else False,
+            "gradient_checkpointing": True if torch.cuda.is_available() else False,
+            "memory_efficient_attention": True if torch.cuda.is_available() else False,
         }
     }
 
@@ -240,15 +266,32 @@ def run_quick_demo():
 
     try:
         # Import the LLM components
-        from llm_mentor import create_llm_mentor
-        from llm_config import LLM_MENTOR_CONFIG
+        from llm_mentor import create_llm_mentor # This will use the corrected LLMMentor
+        from llm_config import LLM_MENTOR_CONFIG, DEVICE # Ensure DEVICE is imported and used
 
         print("🤖 Creating LLM mentor...")
-        mentor = create_llm_mentor(state_dim=4, num_actions=2)
+        # Use the recommended_model from the JSON config if it exists,
+        config_file_path = "llm_pipeline_config.json"
+        llm_model_to_use = LLM_MENTOR_CONFIG['model_name'] # Default
+        if os.path.exists(config_file_path):
+            try:
+                with open(config_file_path, 'r') as f:
+                    pipeline_config = json.load(f)
+                    llm_model_to_use = pipeline_config.get("recommended_llm_model", llm_model_to_use)
+                    print(f"   Using model from llm_pipeline_config.json: {llm_model_to_use}")
+            except Exception as e:
+                print(f"   Could not read llm_pipeline_config.json, using default model from llm_config.py. Error: {e}")
+        else:
+             print(f"   llm_pipeline_config.json not found, using default model from llm_config.py: {llm_model_to_use}")
+
+
+        mentor = create_llm_mentor(state_dim=4, num_actions=2, model_name=llm_model_to_use)
+        mentor.to(DEVICE) # Ensure mentor and its submodules are on the correct device
 
         print("🧪 Testing mentor with sample CartPole state...")
         # Test state: cart at center, moving right, pole leaning right, angular velocity positive
-        test_state = torch.tensor([0.1, 0.5, 0.15, 1.0]).unsqueeze(0)
+        test_state = torch.tensor([0.1, 0.5, 0.15, 1.0], device=DEVICE).unsqueeze(0)
+
 
         advice = mentor.get_advice(test_state, verbose=True)
 
@@ -260,7 +303,8 @@ def run_quick_demo():
 
         # Test neural forward pass
         print("\n🧠 Testing neural integration...")
-        outputs = mentor(test_state)
+        with torch.no_grad(): # Ensure no gradients are computed during inference
+            outputs = mentor(test_state)
         print(f"   Policy logits: {outputs['policy_logits'].cpu().numpy()}")
         print(f"   Value: {outputs['value'].item():.3f}")
 
@@ -294,8 +338,8 @@ def main():
 
     # Step 1: Check GPU
     if not check_gpu_capability():
-        print("\n❌ GPU check failed. Please ensure you have a CUDA-capable GPU.")
-        return
+        print("\n❌ GPU check failed. Please ensure you have a CUDA-capable GPU for full functionality.")
+        # Allow to proceed for CPU testing if user desires, but LLM loading will be skipped for GPU models.
 
     # Step 2: Install dependencies
     if not install_llm_dependencies():
@@ -303,10 +347,23 @@ def main():
         return
 
     # Step 3: Test LLM loading
-    recommended_model = test_llm_loading()
-    if not recommended_model:
-        print("\n❌ No suitable LLM model found.")
+    recommended_model = None
+    if torch.cuda.is_available(): # Only test loading if GPU is there, as models are GPU-heavy
+        recommended_model = test_llm_loading()
+        if not recommended_model:
+            print("\n⚠️ No suitable LLM model could be loaded on GPU. Demo will likely fail or run on CPU if LLM is required.")
+            # Provide a CPU-compatible default if all GPU attempts fail
+            recommended_model = " TinyLlama/TinyLlama-1.1B-Chat-v1.0" # A smaller model that might work on CPU (though slowly)
+            print(f"   Falling back to default CPU-testable model: {recommended_model} for config generation.")
+    else:
+        print("\nℹ️ CUDA not available. Skipping LLM loading test. Configuration will be for CPU.")
+        # Provide a CPU-compatible default
+        recommended_model = " TinyLlama/TinyLlama-1.1B-Chat-v1.0" # Example, or make it None if CPU LLM not supported by pipeline
+
+    if not recommended_model: # If still None after GPU check and CPU fallback
+        print("\n❌ No recommended LLM model could be determined. Cannot proceed with demo config.")
         return
+
 
     # Step 4: Create configuration
     create_optimized_config(recommended_model)
@@ -318,18 +375,21 @@ def main():
     print("\n" + "=" * 60)
     if demo_success:
         print("🎉 Setup completed successfully!")
-        print(f"🎯 Recommended LLM: {recommended_model}")
+        print(f"🎯 Recommended LLM for config: {recommended_model}")
         print("🚀 Ready to run: python llm_main.py")
         print("\nNext steps:")
-        print("1. Run: python llm_main.py --memory_test  # Test memory usage")
-        print("2. Run: python llm_main.py                # Start training")
-        print("3. Monitor GPU memory with: nvidia-smi")
+        print("1. Review 'llm_pipeline_config.json' - it has been created/updated.")
+        print("2. Run: python llm_main.py --memory_test  # Test memory usage (if GPU available)")
+        print("3. Run: python llm_main.py                # Start training")
+        if torch.cuda.is_available():
+            print("4. Monitor GPU memory with: nvidia-smi")
     else:
         print("❌ Setup completed with issues. Check the logs above.")
         print("💡 Troubleshooting:")
-        print("- Ensure sufficient VRAM (6GB+ recommended)")
-        print("- Try smaller models if memory issues persist")
-        print("- Check internet connection for model downloads")
+        print("- Ensure sufficient VRAM (6GB+ recommended for smaller LLMs on GPU)")
+        print("- If on CPU, expect very slow LLM performance if used.")
+        print("- Check internet connection for model downloads.")
+        print("- Ensure all dependencies from `install_llm_dependencies` installed correctly.")
 
     print("=" * 60)
 

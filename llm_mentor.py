@@ -68,14 +68,26 @@ class MemoryOptimizedLLM:
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
-            # Load model with safer settings for compatibility
+            # Determine attention implementation
+            attn_implementation = "eager"
+            if "phi-3" in self.model_name.lower():
+                attn_implementation = "eager" # Phi-3 often works better with eager
+            elif torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+                 # Flash Attention 2 is typically available for Ampere and newer
+                attn_implementation = "flash_attention_2"
+            else:
+                attn_implementation = "sdpa"
+
+
+            print(f"   Using attn_implementation: {attn_implementation}")
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 self.model_name,
                 torch_dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
-                attn_implementation="eager"  # Use eager attention for compatibility
+                attn_implementation=attn_implementation
             )
 
             # Set to eval mode
@@ -269,7 +281,7 @@ Physics: Gravitational torque = {9.8 * 0.1 * 0.5 * np.sin(angle):.3f} N⋅m
                 multi_step = data.get("multi_step_plan", [action])
 
                 # Validate action
-                if not isinstance(action, int) or action < 0 or action > 1:
+                if not isinstance(action, int) or action < 0 or action > 1: # Assuming num_actions is 2 for CartPole
                     action = 0
 
                 # Validate multi-step plan
@@ -279,7 +291,7 @@ Physics: Gravitational torque = {9.8 * 0.1 * 0.5 * np.sin(angle):.3f} N⋅m
                 # Clean multi-step actions
                 clean_actions = []
                 for a in multi_step[:3]:  # Max 3 actions
-                    if isinstance(a, (int, float)) and 0 <= int(a) <= 1:
+                    if isinstance(a, (int, float)) and 0 <= int(a) <= 1: # Assuming num_actions is 2
                         clean_actions.append(int(a))
 
                 if not clean_actions:
@@ -307,8 +319,9 @@ Physics: Gravitational torque = {9.8 * 0.1 * 0.5 * np.sin(angle):.3f} N⋅m
         action_match = re.search(r'(?:action|choose|select).*?(\d+)', response.lower())
         action = int(action_match.group(1)) if action_match else 0
 
-        # Ensure valid action
+        # Ensure valid action (assuming num_actions 2 for CartPole)
         action = max(0, min(1, action))
+
 
         # Extract confidence
         conf_match = re.search(r'confidence[:\s]*(0?\.\d+|\d+\.?\d*)', response.lower())
@@ -326,7 +339,7 @@ Physics: Gravitational torque = {9.8 * 0.1 * 0.5 * np.sin(angle):.3f} N⋅m
     def _emergency_fallback(self, response: str) -> LLMAdvice:
         """Emergency fallback when all parsing fails"""
         return LLMAdvice(
-            actions=[0],
+            actions=[0], # Default safe action
             confidence=0.1,
             reasoning=["Emergency fallback: Default safe action"],
             causal_effects={"action_0": 0.5, "action_1": 0.5},
@@ -367,7 +380,7 @@ class LLMMentor(nn.Module):
 
         # Causal understanding network
         self.causal_network = nn.Sequential(
-            nn.Linear(state_dim + num_actions, self.hidden_dim),
+            nn.Linear(state_dim + 1, self.hidden_dim), # Corrected: state_dim + 1 for scalar action
             nn.GELU(),
             nn.Linear(self.hidden_dim, state_dim)
         ).to(DEVICE)
@@ -421,7 +434,7 @@ class LLMMentor(nn.Module):
                 print(f"⚠️ LLM integration failed: {e}")
 
         # Create planning logits (multi-step reasoning)
-        planning_logits = policy_logits.unsqueeze(1).repeat(1, 5, 1)
+        planning_logits = policy_logits.unsqueeze(1).repeat(1, 5, 1) # Assuming planning_horizon = 5
 
         # Causal features for advanced distillation
         causal_features = self._compute_causal_features(state)
@@ -431,7 +444,7 @@ class LLMMentor(nn.Module):
             'value': value,
             'features': features,
             'causal_features': causal_features,
-            'confidence': torch.sigmoid(value),
+            'confidence': torch.sigmoid(value), # Assuming confidence is derived from value
             'planning_logits': planning_logits
         }
 
@@ -441,9 +454,9 @@ class LLMMentor(nn.Module):
         causal_features_list = []
 
         for action_idx in range(self.num_actions):
-            # Create action tensor
-            action_tensor = torch.full((batch_size, 1), action_idx,
-                                       dtype=torch.float32, device=DEVICE)
+            # Create action tensor (scalar representation of action index)
+            action_tensor = torch.full((batch_size, 1), float(action_idx), # Ensure float for cat if state is float
+                                       dtype=state.dtype, device=DEVICE)
 
             # Predict causal effects
             causal_input = torch.cat([state, action_tensor], dim=1)
@@ -480,7 +493,7 @@ class LLMMentor(nn.Module):
             advice = self.prompt_manager.parse_llm_response(response)
 
             # Cache successful result
-            if len(self.advice_cache) < 200 and advice.confidence > 0.3:
+            if len(self.advice_cache) < 200 and advice.confidence > 0.3: # Cache limit
                 self.advice_cache[state_key] = advice
 
             return advice
@@ -489,7 +502,7 @@ class LLMMentor(nn.Module):
             print(f"⚠️ LLM decision error: {e}")
             # Return sophisticated fallback
             return LLMAdvice(
-                actions=[0],
+                actions=[0], # Default safe action
                 confidence=0.1,
                 reasoning=["LLM error: Physics-based fallback control"],
                 causal_effects={"action_0": 0.5, "action_1": 0.5},
@@ -499,10 +512,13 @@ class LLMMentor(nn.Module):
 
     def get_advice(self, state: torch.Tensor, verbose: bool = False) -> LLMAdvice:
         """Get sophisticated multimodal advice from LLM mentor"""
-        if state.dim() > 1:
-            state = state[0]  # Take first state from batch
+        if state.dim() > 1 and state.shape[0] > 1: # If batch, take first
+            state_for_advice = state[0]
+        else:
+            state_for_advice = state.squeeze(0) if state.dim() > 1 else state
 
-        state_np = state.cpu().numpy()
+
+        state_np = state_for_advice.cpu().numpy()
         advice = self._get_llm_decision(state_np)
 
         if verbose:
@@ -516,9 +532,12 @@ class LLMMentor(nn.Module):
 
     def predict_action_effects(self, state: torch.Tensor, action: int) -> torch.Tensor:
         """Predict sophisticated causal effects of an action"""
-        # Ensure proper device handling
+         # Ensure state is a batch of 1 if it's a single instance
+        if state.dim() == 1:
+            state = state.unsqueeze(0)
         state = state.to(DEVICE)
-        action_tensor = torch.tensor([[action]], dtype=torch.float32, device=DEVICE)
+
+        action_tensor = torch.tensor([[float(action)]], dtype=state.dtype, device=DEVICE) # Scalar action
 
         causal_input = torch.cat([state, action_tensor], dim=1)
         predicted_change = self.causal_network(causal_input)
@@ -527,16 +546,16 @@ class LLMMentor(nn.Module):
 
     def get_performance_stats(self) -> Dict[str, float]:
         """Get comprehensive LLM performance statistics"""
-        total_queries = self.query_count + self.cache_hits
-        cache_rate = self.cache_hits / total_queries if total_queries > 0 else 0
-        success_rate = self.successful_queries / self.query_count if self.query_count > 0 else 0
+        total_queries_attempted = self.query_count + self.cache_hits
+        cache_rate = self.cache_hits / total_queries_attempted if total_queries_attempted > 0 else 0
+        success_rate_of_llm_calls = self.successful_queries / self.query_count if self.query_count > 0 else 0
 
         return {
-            'total_queries': total_queries,
-            'llm_queries': self.query_count,
+            'total_queries_attempted': total_queries_attempted,
+            'llm_queries_made': self.query_count,
             'cache_hits': self.cache_hits,
             'cache_hit_rate': cache_rate,
-            'success_rate': success_rate,
+            'llm_successful_query_integration_rate': success_rate_of_llm_calls,
             'memory_usage_gb': self.llm._estimate_model_size()
         }
 
@@ -568,17 +587,18 @@ def create_llm_mentor(state_dim: int, num_actions: int,
     if model_name not in model_options:
         model_options.insert(0, model_name)
 
-    for model in model_options:
+    for model_candidate_name in model_options:
         try:
-            print(f"🔄 Attempting to load: {model}")
-            mentor = LLMMentor(state_dim, num_actions, model)
+            print(f"🔄 Attempting to load: {model_candidate_name}")
+            mentor = LLMMentor(state_dim, num_actions, model_candidate_name)
 
             # Test the mentor with a dummy state
             test_state = torch.randn(1, state_dim).to(DEVICE)
             with torch.no_grad():
-                test_output = mentor(test_state)
+                _ = mentor(test_state) # Test forward pass
+                _ = mentor.get_advice(test_state) # Test advice generation
 
-            print(f"✅ Successfully loaded Revolutionary LLM Mentor: {model}")
+            print(f"✅ Successfully loaded Revolutionary LLM Mentor: {model_candidate_name}")
             print(f"   Multimodal Understanding: ✅")
             print(f"   Physics Reasoning: ✅")
             print(f"   Causal Inference: ✅")
@@ -586,7 +606,12 @@ def create_llm_mentor(state_dim: int, num_actions: int,
             return mentor
 
         except Exception as e:
-            print(f"❌ Failed to load {model}: {e}")
+            print(f"❌ Failed to load {model_candidate_name}: {e}")
+            # If a specific model fails, clean up before trying the next
+            if 'mentor' in locals():
+                del mentor
+            torch.cuda.empty_cache()
+            gc.collect()
             continue
 
     raise RuntimeError("❌ Could not load any LLM model. Check GPU memory and internet connection.")

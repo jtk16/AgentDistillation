@@ -45,8 +45,8 @@ class Logger:
         log_entry = f"[{timestamp}] [{level}] {message}"
         print(log_entry)
 
-        with open(self.log_file, 'a') as f:
-            f.write(log_entry + '\n')
+        with open(self.log_file, 'a', encoding='utf-8') as f:
+            f.write(log_entry + "\n")
 
     def log_step(self, timestep: int, metrics: Dict[str, Any]):
         """Log training step metrics"""
