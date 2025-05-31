@@ -25,10 +25,11 @@ from torch.distributions import Categorical
 
 # Import from mathematical_framework (MODIFIED)
 from mathematical_framework import PathwayImportanceOptimizer, \
-    InformationTheoreticAnalyzer # Removed CriticalPathwayAnalyzer here
+    InformationTheoreticAnalyzer  # Removed CriticalPathwayAnalyzer here
 
 from activation_distillation import (
-    HumanDemonstrationCollector, ActivationTracker, CriticalPathwayAnalyzer as MathCriticalPathwayAnalyzer, # ADDED CriticalPathwayAnalyzer and alias here
+    HumanDemonstrationCollector, ActivationTracker,
+    CriticalPathwayAnalyzer as MathCriticalPathwayAnalyzer,  # ADDED CriticalPathwayAnalyzer and alias here
     ActivationSignatureExtractor, FocusedDistillationLoss, create_activation_based_distillation_pipeline
 )
 
@@ -47,7 +48,8 @@ class EnhancedRevolutionaryPipeline:
 
         # Create environment
         self.env = create_environment()
-        self.reward_shaper = AdvancedRewardShaper(ENV_CONFIG['name'])
+        self.reward_shaper = AdvancedRewardShaper(ENV_CONFIG['name'],
+                                                  num_envs=self.env.num_envs)  # Pass num_envs to reward shaper
 
         # Initialize models
         self.mentor = MultimodalMentor(
@@ -150,7 +152,7 @@ class EnhancedRevolutionaryPipeline:
             self._phase1_human_behavior_cloning()
         elif not self.args.skip_behavior_cloning:
             self.logger.log("No human demonstrations path provided, generating synthetic demos for Phase 1...")
-            self._generate_synthetic_demonstrations()
+            self._generate_synthetic_demonstrations()  # This now calls _process_demonstrations internally
         else:
             self.logger.log("Skipping Phase 1 (Human Behavior Cloning / Synthetic Demos).")
 
@@ -182,7 +184,7 @@ class EnhancedRevolutionaryPipeline:
             if self.experience_collector.next_states:
                 observations = self.experience_collector.next_states[-1]  # This gets the numpy array for next obs
             else:  # If no rollouts yet (e.g. very start), keep current observations
-                pass
+                pass  # observations remains from the last reset or step
 
             # === TRAINING PHASE ===
             if self.timestep > TRAINING_CONFIG['batch_size']:  # Ensure enough samples collected
@@ -205,165 +207,157 @@ class EnhancedRevolutionaryPipeline:
                 self.curriculum.get_current_config(avg_reward)
 
             # === CHECKPOINTING ===
-            if self.timestep % LOGGING_CONFIG['save_interval'] == 0:
+            if self.timestep > 0 and self.timestep % LOGGING_CONFIG['save_interval'] == 0:
                 self._save_checkpoint()
 
             # === LOGGING ===
-            if self.timestep % LOGGING_CONFIG['log_interval'] == 0:
+            if self.timestep > 0 and self.timestep % LOGGING_CONFIG['log_interval'] == 0:
                 self._log_progress(time.time() - start_time)
 
         self.logger.log("Enhanced training completed!")
         self._final_evaluation()
 
-    def _phase1_human_behavior_cloning(self):
-        """Phase 1: Train mentor on human demonstrations and extract critical pathways"""
-        self.logger.log("Starting human behavior cloning phase...")
-
-        # Load human demonstrations
-        demo_collector = self.activation_pipeline['demonstration_collector']
-
-        if self.args.human_demos_path and os.path.exists(self.args.human_demos_path):
-            raw_demonstrations = self._load_human_demonstrations(self.args.human_demos_path)
-            # Use the collector to process/store them if needed, or use directly
-            for demo_data in raw_demonstrations:
-                demo_collector.collect_demonstration(
-                    states=demo_data['states'],  # List of np.ndarray
-                    actions=demo_data['actions'],  # List of int
-                    performance_score=demo_data['performance_score']
-                )
-            demonstrations_for_bc = demo_collector.get_successful_demonstrations()
-
-        else:
-            self.logger.log("No human demonstrations found or path invalid, skipping actual BC training in Phase 1.")
-            # Fallback: generate synthetic ones to allow pathway analysis logic to run if needed
-            self._generate_synthetic_demonstrations()  # This will populate demo_collector
-            demonstrations_for_bc = demo_collector.demonstrations  # Use all synthetic ones
-
+    def _process_demonstrations_for_pathways(self, demonstrations_for_bc: List[Dict]):
+        """Helper function to process demonstrations and extract critical pathways."""
         if not demonstrations_for_bc:
             self.logger.log(
-                "No demonstrations available for behavior cloning after loading/synthesis. Skipping pathway analysis.")
+                "No demonstrations available for behavior cloning. Skipping pathway analysis.")
             return
 
-        # Train mentor on demonstrations with activation tracking
-        # Store sequences of (activations_dict_per_step, performance_score_of_demo)
         activations_sequence_for_graph = []
         importance_scores_sequence_for_graph = []
-        performance_scores_for_signatures = []  # List of floats
+        performance_scores_for_signatures = []
 
-        for epoch in range(50):  # Behavior cloning epochs
+        # Behavior Cloning Training for Mentor (simplified loop)
+        for epoch in range(MENTOR_CONFIG.get('bc_epochs', 50)):  # Get epochs from config or default
             epoch_total_bc_loss = 0
             num_bc_batches = 0
-
             for demo_idx, demo in enumerate(demonstrations_for_bc):
-                demo_states_np = demo['states']  # List of np.ndarrays
-                demo_actions_np = demo['actions']  # List of ints
+                demo_states_np = demo['states']
+                demo_actions_np = demo['actions']
                 demo_performance = demo['performance_score']
 
-                # Process demo step-by-step or as a batch if model supports it
-                # For simplicity, let's assume we process each step to get activations
-                # This part needs to be robust to how demos are structured and fed.
-
-                # Convert entire demo to tensors
                 states_tensor = torch.tensor(np.array(demo_states_np), dtype=torch.float32).to(DEVICE)
                 actions_tensor = torch.tensor(np.array(demo_actions_np), dtype=torch.long).to(DEVICE)
 
-                if states_tensor.ndim == 1: states_tensor = states_tensor.unsqueeze(0)  # if single step demo
+                if states_tensor.ndim == 1: states_tensor = states_tensor.unsqueeze(0)
                 if actions_tensor.ndim == 0: actions_tensor = actions_tensor.unsqueeze(0)
+                if states_tensor.shape[0] == 0: continue  # Skip empty demos
 
-                # --- Behavior Cloning Update ---
                 self.mentor.train()
                 self.mentor_tracker.clear_cache()
-                mentor_outputs_bc = self.mentor(states_tensor)  # Get outputs for all steps in demo
+                mentor_outputs_bc = self.mentor(states_tensor)
 
                 bc_loss = F.cross_entropy(mentor_outputs_bc['policy_logits'], actions_tensor)
                 epoch_total_bc_loss += bc_loss.item()
                 num_bc_batches += 1
 
                 self.mentor.optimizer.zero_grad()
-                bc_loss.backward(retain_graph=True)  # Retain graph for importance computation if needed by analyzer
+                bc_loss.backward(retain_graph=True)
 
-                # --- Activation and Importance Collection ---
-                # Get activations for each step in the demo
-                # The current ActivationTracker captures the *last* forward pass's activations.
-                # To get per-step activations for a sequence, we'd need to call mentor() per step.
-                # For now, let's simplify: use the activations from the batch forward pass of the demo.
-                # This means 'activations_for_graph_step' will be a dict of tensors (Batch=DemoLength, Features)
+                activations_for_graph_step = self.mentor_tracker.get_activations()
+                if not activations_for_graph_step: continue
 
-                activations_for_graph_step = self.mentor_tracker.get_activations()  # (Batch=DemoLength, Features) per layer
+                # Ensure target_performance for compute_activation_importance is a tensor
+                target_perf_tensor = torch.tensor(demo_performance, device=DEVICE, dtype=torch.float32)
 
-                # Compute importance (e.g. gradient-based) using the demo's performance score
-                # The target_performance for compute_activation_importance expects a float or scalar tensor.
                 importance_for_graph_step = self.pathway_analyzer.compute_activation_importance(
-                    activations_for_graph_step,  # Dict: layer -> (DemoLength, Features)
-                    demo_performance,  # float
+                    activations_for_graph_step,
+                    target_perf_tensor,  # Pass tensor here
                     method='gradient_based'
                 )
+                self.mentor.optimizer.step()
 
-                self.mentor.optimizer.step()  # Step after getting grads for importance
-
-                # For graph building, we need List[Dict[str, Tensor]] where each Dict is one timestep.
-                # Current activations_for_graph_step is {layer: (DemoSteps, Feats)}. We need to unroll this.
                 num_steps_in_demo = states_tensor.shape[0]
                 for step_idx in range(num_steps_in_demo):
-                    step_activations = {layer: act_tensor[step_idx].unsqueeze(0) for layer, act_tensor in
-                                        activations_for_graph_step.items() if
-                                        act_tensor.numel() > 0}  # Make it (1,Feats)
-                    step_importance = {layer: imp_tensor[step_idx].unsqueeze(0) for layer, imp_tensor in
-                                       importance_for_graph_step.items() if imp_tensor.numel() > 0}
+                    step_activations = {
+                        layer: act_tensor[step_idx].unsqueeze(0)
+                        for layer, act_tensor in activations_for_graph_step.items()
+                        if act_tensor.numel() > 0 and act_tensor.shape[0] == num_steps_in_demo
+                    }
+                    step_importance = {
+                        layer: imp_tensor[step_idx].unsqueeze(0)
+                        for layer, imp_tensor in importance_for_graph_step.items()
+                        if imp_tensor.numel() > 0 and imp_tensor.shape[0] == num_steps_in_demo
+                    }
 
-                    if step_activations:  # only if there are valid activations
+                    if step_activations:
                         activations_sequence_for_graph.append(step_activations)
                         importance_scores_sequence_for_graph.append(step_importance)
-                        performance_scores_for_signatures.append(demo_performance)  # Corresponding performance
-
+                        performance_scores_for_signatures.append(demo_performance)
             avg_bc_loss_epoch = epoch_total_bc_loss / num_bc_batches if num_bc_batches > 0 else 0
             if epoch % 10 == 0:
                 self.logger.log(f"Behavior cloning epoch {epoch}, avg loss: {avg_bc_loss_epoch:.4f}")
-
-        self.mentor.eval()  # Set mentor to eval mode after BC training
+        self.mentor.eval()
 
         if not activations_sequence_for_graph or not importance_scores_sequence_for_graph:
             self.logger.log("No valid activation/importance sequences collected from BC. Skipping pathway analysis.")
             return
 
-        # Build activation graph and identify critical pathways
         self.logger.log("Analyzing critical activation pathways from mentor BC...")
-        # Use the shared self.pathway_analyzer
         activation_graph = self.pathway_analyzer.build_activation_graph(
             activations_sequence_for_graph, importance_scores_sequence_for_graph
         )
 
+        critical_pathways_nodesets = []
         if activation_graph.number_of_nodes() > 0:
             critical_pathways_nodesets = self.pathway_analyzer.identify_critical_pathways(
-                activation_graph, method='spectral_clustering'  # Or other methods
+                activation_graph, method='spectral_clustering'
             )
         else:
             self.logger.log("Activation graph has no nodes. Skipping pathway identification.")
-            critical_pathways_nodesets = []
 
         if not critical_pathways_nodesets:
             self.logger.log("No critical pathways identified. Focused distillation may be impacted.")
             self.critical_signatures = []
             return
 
-        # Extract activation signatures using the more principled PathwayImportanceOptimizer
-        # The signature_extractor now needs the optimizer and the analyzer.
-        # It also needs performance_scores_sequence for the optimizer.
         self.logger.log(f"Extracting {len(critical_pathways_nodesets)} critical pathway signatures...")
+        # Ensure performance_scores_for_signatures matches length of activations_sequence_for_graph if pathway_optimizer uses it per step
+        # The current pathway_optimizer.compute_pathway_importance_matrix expects a single performance_scores tensor (Batch,)
+        # that aligns with the 'Batch' dimension of the activations it processes.
+        # The signature_extractor's current use of performance_scores_sequence is for the PathwayImportanceOptimizer.
+        # Let's ensure it gets a representative set of scores if needed, or adjust the optimizer.
+        # For now, pass the list of individual demo scores.
         self.critical_signatures = self.signature_extractor.extract_signatures(
-            critical_pathways_nodesets,  # List[Set[str]]
-            activations_sequence_for_graph,  # List[Dict[str, Tensor (1,Feats)]]
-            performance_scores_sequence=performance_scores_for_signatures,  # List[float]
-            target_dim=MENTOR_CONFIG.get('num_knowledge_tokens', 64)  # Or specific dim from config
+            critical_pathways_nodesets,
+            activations_sequence_for_graph,
+            performance_scores_sequence=performance_scores_for_signatures,
+            target_dim=MENTOR_CONFIG.get('num_knowledge_tokens', 64)
         )
 
         if self.critical_signatures:
             self.logger.log(f"Identified and extracted {len(self.critical_signatures)} critical activation signatures.")
             avg_importance = np.mean(
                 [sig.importance_score for sig in self.critical_signatures if sig]) if self.critical_signatures else 0
-            self.logger.log(f"Average signature importance (from optimizer): {avg_importance:.4f}")
+            self.logger.log(f"Average signature importance (from optimizer/fallback): {avg_importance:.4f}")
         else:
             self.logger.log("No critical signatures were extracted.")
+
+    def _phase1_human_behavior_cloning(self):
+        """Phase 1: Train mentor on human demonstrations and extract critical pathways"""
+        self.logger.log("Starting human behavior cloning phase...")
+        demo_collector = self.activation_pipeline['demonstration_collector']
+        raw_demonstrations = []
+        if self.args.human_demos_path and os.path.exists(self.args.human_demos_path):
+            raw_demonstrations = self._load_human_demonstrations(self.args.human_demos_path)
+            for demo_data in raw_demonstrations:
+                demo_collector.collect_demonstration(
+                    states=demo_data['states'],
+                    actions=demo_data['actions'],
+                    performance_score=demo_data['performance_score']
+                )
+        else:
+            self.logger.log("No human demonstrations found or path invalid. Skipping actual BC training in Phase 1.")
+            # Fallback handled by _generate_synthetic_demonstrations if called before this.
+            # If this is the primary entry point for BC, it should use collected demos.
+            # This method will be called after _generate_synthetic_demonstrations if needed.
+
+        demonstrations_to_process = demo_collector.get_successful_demonstrations()
+        if not demonstrations_to_process and demo_collector.demonstrations:  # Use all if no successful ones (e.g. only synthetic)
+            demonstrations_to_process = demo_collector.demonstrations
+
+        self._process_demonstrations_for_pathways(demonstrations_to_process)
 
     def _generate_synthetic_demonstrations(self):
         """Generate synthetic demonstrations using random policy (fallback)"""
@@ -372,61 +366,63 @@ class EnhancedRevolutionaryPipeline:
         demo_collector.demonstrations = []  # Clear any previous
 
         num_synthetic_demos = 10
+        max_steps_per_demo = 200
+
         for episode in range(num_synthetic_demos):
-            obs_list_np, _ = self.env.reset()  # obs_list_np is (num_envs, state_dim)
+            obs_list_np, _ = self.env.reset()
+            current_obs_np_list = obs_list_np  # current_obs_np_list is (num_envs, state_dim)
 
-            # For synthetic demos, let's use the first env for simplicity if num_envs > 1
-            current_obs_np = obs_list_np[0] if self.env.num_envs > 1 else obs_list_np
-
-            states_buffer, actions_buffer = [], []
-            episode_reward_sum = 0
-            max_steps_per_demo = 200
+            # Store states and actions for each env separately during the episode
+            episode_states_buffer_all_envs = [[] for _ in range(self.env.num_envs)]
+            episode_actions_buffer_all_envs = [[] for _ in range(self.env.num_envs)]
+            episode_reward_sum_all_envs = np.zeros(self.env.num_envs)
 
             for step in range(max_steps_per_demo):
-                # Use a single random action for the first environment
-                action_for_env0 = np.random.randint(0, self.env.num_actions)
-
-                # Prepare actions list for potentially vectorized env.step
-                # If num_envs > 1, other envs also need actions. Let them be random too.
                 actions_for_all_envs = [[np.random.randint(0, self.env.num_actions)] for _ in range(self.env.num_envs)]
-                actions_for_all_envs[0] = [action_for_env0]  # Set action for our target env
-
-                # Dummy uncertainties
                 uncertainties_for_all_envs = [0.5] * self.env.num_envs
 
-                next_obs_list_np, rewards_np, terminated_np, truncated_np, _ = self.env.step(
+                next_obs_list_np, rewards_np, terminated_np, truncated_np, infos_from_env = self.env.step(
                     actions_for_all_envs, uncertainties_for_all_envs
                 )
 
-                states_buffer.append(current_obs_np.copy())
-                actions_buffer.append(action_for_env0)
+                for i in range(self.env.num_envs):
+                    episode_states_buffer_all_envs[i].append(current_obs_np_list[i].copy())
+                    episode_actions_buffer_all_envs[i].append(actions_for_all_envs[i][0])
+                    episode_reward_sum_all_envs[i] += rewards_np[i]
 
-                reward_env0 = rewards_np[0]
-                episode_reward_sum += reward_env0
+                current_obs_np_list = next_obs_list_np
 
-                current_obs_np = next_obs_list_np[0] if self.env.num_envs > 1 else next_obs_list_np
-
-                if terminated_np[0] or truncated_np[0]:
+                # Check if all envs are done
+                if np.all(terminated_np | truncated_np):
                     break
 
-            # Normalize performance score (example normalization)
-            performance_score = min(1.0, max(0.0, episode_reward_sum / (
-                max_steps_per_demo * 0.1 if ENV_CONFIG['name'] == 'CartPole-v1' else 100.0)))
-            if states_buffer:  # Only collect if some steps were taken
-                demo_collector.collect_demonstration(states_buffer, actions_buffer, performance_score)
+            # Collect demonstrations from each environment
+            for i in range(self.env.num_envs):
+                if episode_states_buffer_all_envs[i]:  # Only if steps were taken for this env
+                    performance_score = min(1.0, max(0.0, episode_reward_sum_all_envs[i] / (
+                        max_steps_per_demo * 0.1 if ENV_CONFIG['name'] == 'CartPole-v1' else 100.0)))
+                    demo_collector.collect_demonstration(
+                        episode_states_buffer_all_envs[i],
+                        episode_actions_buffer_all_envs[i],
+                        performance_score
+                    )
 
-        self.logger.log(f"Generated {len(demo_collector.demonstrations)} synthetic demonstrations.")
-        # After generating synthetic demos, call phase1 again to process them for pathways
-        # This creates a recursive call risk if _phase1_human_behavior_cloning itself calls this.
-        # Instead, _phase1_human_behavior_cloning should use the collected demos.
-        # The current logic is: if no path, call this, then _phase1 uses demo_collector.demonstrations. This is okay.
+        self.logger.log(
+            f"Generated {len(demo_collector.demonstrations)} synthetic demonstrations from {num_synthetic_demos} multi-env episodes.")
+        # After generating, process them for pathways
+        self._process_demonstrations_for_pathways(demo_collector.demonstrations)
 
     def _update_training_phase(self):
         """Update training phase based on timestep"""
         if self.timestep < self.phase_transitions['human_cloning']:
             self.training_phase = 'human_cloning'  # Or a 'post_bc_pre_focus' phase
         elif self.timestep < self.phase_transitions['focused_distillation']:
-            self.training_phase = 'focused_distillation'
+            if not self.critical_signatures:  # If no signatures, can't do focused.
+                self.training_phase = 'standard_training'
+                if self.timestep == self.phase_transitions['human_cloning']:  # Log phase skip once
+                    self.logger.log("No critical signatures found, skipping focused_distillation phase.")
+            else:
+                self.training_phase = 'focused_distillation'
         else:
             self.training_phase = 'standard_training'
 
@@ -440,8 +436,11 @@ class EnhancedRevolutionaryPipeline:
 
         # Ensure all required keys are in batch_data
         required_keys = ['rewards', 'values', 'dones', 'states', 'actions', 'log_probs']
-        if not all(key in batch_data and batch_data[key].numel() > 0 for key in required_keys):
-            # self.logger.log("Batch data incomplete for focused training.")
+        # MODIFIED: Check for None and tensor type before numel
+        if not all(
+                key in batch_data and isinstance(batch_data[key], torch.Tensor) and batch_data[key].numel() > 0 for key
+                in required_keys):
+            self.logger.log("Batch data incomplete for focused training (some keys missing, None, or empty tensors).")
             return {}
 
         # Compute advantages using GAE
@@ -500,18 +499,22 @@ class EnhancedRevolutionaryPipeline:
                 mentor_activations_distill = self.mentor_tracker.get_activations()  # From mentor pass
                 student_activations_distill_and_rl = self.student_tracker.get_activations()  # From student pass
 
-                # Compute focused distillation loss
-                # Ensure critical_signatures are valid
-                valid_signatures = [cs for cs in self.critical_signatures if cs is not None]
-                if not valid_signatures:
-                    # print("Warning: No valid critical signatures for focused loss computation.")
-                    focused_losses = {'total_focused': torch.tensor(0.0, device=DEVICE)}  # Provide a zero tensor
+                if not mentor_activations_distill or not student_activations_distill_and_rl:
+                    # print("Warning: Missing activations for focused loss computation.")
+                    focused_losses = {'total_focused': torch.tensor(0.0, device=DEVICE)}
                 else:
-                    focused_losses = self.focused_distillation_loss(
-                        student_outputs_distill_and_rl, mentor_outputs_distill,
-                        student_activations_distill_and_rl, mentor_activations_distill,
-                        valid_signatures
-                    )
+                    # Compute focused distillation loss
+                    # Ensure critical_signatures are valid
+                    valid_signatures = [cs for cs in self.critical_signatures if cs is not None]
+                    if not valid_signatures:
+                        # print("Warning: No valid critical signatures for focused loss computation.")
+                        focused_losses = {'total_focused': torch.tensor(0.0, device=DEVICE)}  # Provide a zero tensor
+                    else:
+                        focused_losses = self.focused_distillation_loss(
+                            student_outputs_distill_and_rl, mentor_outputs_distill,
+                            student_activations_distill_and_rl, mentor_activations_distill,
+                            valid_signatures
+                        )
 
                 # Add standard RL losses (PPO)
                 rl_losses = self._compute_rl_losses(
@@ -566,8 +569,11 @@ class EnhancedRevolutionaryPipeline:
             return {}
 
         required_keys = ['rewards', 'values', 'dones', 'states', 'actions', 'log_probs']
-        if not all(key in batch_data and batch_data[key].numel() > 0 for key in required_keys):
-            # self.logger.log("Batch data incomplete for standard training.")
+        # MODIFIED: Add type check for tensor and ensure it's not None before calling .numel()
+        if not all(
+                key in batch_data and isinstance(batch_data[key], torch.Tensor) and batch_data[key].numel() > 0 for key
+                in required_keys):
+            self.logger.log("Batch data incomplete for standard training (some keys missing, None, or empty tensors).")
             return {}
 
         # Compute advantages using GAE
@@ -635,6 +641,12 @@ class EnhancedRevolutionaryPipeline:
         """Compute standard PPO losses. `student_outputs` must contain 'primary_logits' and 'value'."""
 
         # Policy loss (CLIP)
+        # Ensure primary_logits is not None and has correct shape
+        if 'primary_logits' not in student_outputs or student_outputs['primary_logits'] is None:
+            self.logger.log("Missing 'primary_logits' in student_outputs for RL loss.", level="ERROR")
+            return {k: torch.tensor(0.0, device=DEVICE, requires_grad=True) for k in
+                    ['policy_loss', 'value_loss', 'entropy_bonus', 'total_rl']}
+
         dist = Categorical(logits=student_outputs['primary_logits'])
         current_log_probs = dist.log_prob(actions)
         ratio = torch.exp(current_log_probs - old_log_probs)
@@ -644,8 +656,12 @@ class EnhancedRevolutionaryPipeline:
         policy_loss = -torch.min(surr1, surr2).mean()
 
         # Value loss
-        current_values = student_outputs['value'].squeeze(-1)  # Ensure it's [B]
-        value_loss = F.mse_loss(current_values, returns)  # Target for value function is empirical returns
+        if 'value' not in student_outputs or student_outputs['value'] is None:
+            self.logger.log("Missing 'value' in student_outputs for RL loss.", level="ERROR")
+            value_loss = torch.tensor(0.0, device=DEVICE, requires_grad=True)
+        else:
+            current_values = student_outputs['value'].squeeze(-1)  # Ensure it's [B]
+            value_loss = F.mse_loss(current_values, returns)  # Target for value function is empirical returns
 
         # Entropy bonus
         entropy_bonus = dist.entropy().mean()
@@ -678,12 +694,24 @@ class EnhancedRevolutionaryPipeline:
                                 'states' in demo_item and \
                                 'actions' in demo_item and \
                                 'performance_score' in demo_item:
-                            demonstrations.append({
-                                'states': np.array(demo_item['states']),  # Ensure numpy array
-                                'actions': np.array(demo_item['actions']),  # Ensure numpy array
-                                'performance_score': float(demo_item['performance_score']),
-                                'length': len(demo_item['states'])
-                            })
+
+                            # Ensure states and actions are numpy arrays
+                            states_np = np.array(demo_item['states'])
+                            actions_np = np.array(demo_item['actions'])
+
+                            # Basic validation of shapes
+                            if states_np.ndim >= 1 and actions_np.ndim >= 0 and len(states_np) == len(actions_np):
+                                demonstrations.append({
+                                    'states': states_np,
+                                    'actions': actions_np,
+                                    'performance_score': float(demo_item['performance_score']),
+                                    'length': len(states_np)
+                                })
+                            else:
+                                self.logger.log(
+                                    f"Skipping invalid demo item due to shape mismatch or empty data: {demo_item.get('length', 'N/A')}",
+                                    level="WARN")
+
                         else:
                             self.logger.log(f"Skipping invalid demo item: {type(demo_item)}", level="WARN")
 
@@ -704,129 +732,95 @@ class EnhancedRevolutionaryPipeline:
 
         for step_in_rollout in range(TRAINING_CONFIG['rollout_steps']):
             # === STUDENT ACTION SELECTION ===
-            # Student.act expects (Batch=NumEnvs, StateDim)
-            student_actions_list_of_lists, student_info_list_of_dicts = [], []
+            all_env_actions = []
+            all_env_info = []
 
-            # Assuming student.act is designed for single state input and we call it per env for now
-            # Or, if student.act can handle batch, use current_states_tensor directly.
-            # Let's assume student.act handles a batch of states (num_envs, state_dim)
-            # and returns actions as List[List[int]] and info as List[Dict]
-
-            # Check if student.act can handle batch, current implementation might be for single state
-            # For now, let's assume it's modified or we iterate (less efficient)
-            # The student.act in student.py seems to process a batch and extracts item() for single outputs.
-            # It needs to be made more robust for batch operations if num_envs > 1.
-            # Let's proceed assuming student.act handles current_states_tensor (Batch=N_envs, Feats)
-            # and returns actions: List[List[int]] and info: List[Dict] (one per env)
-
-            # Temporary fix for student.act if it doesn't fully support batch output for info part:
-            all_env_actions = []  # This will store List[int] (actions for one env) for each environment
-            all_env_info = []  # This will store Dict (info for one env) for each environment
-
-            if self.env.num_envs > 1:
-                for i in range(self.env.num_envs):
-                    single_state_tensor = current_states_tensor[i].unsqueeze(0)  # Shape: (1, state_dim)
-
-                    # student.act processes a batch. single_state_tensor is batch_size=1.
-                    # actions_batch_for_one_env will be List[List[int]] of length 1, e.g., [[act1, act2,...]]
-                    # info_batch_for_one_env will be List[Dict] of length 1, e.g., [{info_dict_for_this_env}]
-                    actions_batch_for_one_env, info_batch_for_one_env = self.student.act(single_state_tensor)
-
-                    # Correctly extract the single list of actions and the single info dictionary
-                    all_env_actions.append(actions_batch_for_one_env[0])  # Appends List[int]
-                    all_env_info.append(info_batch_for_one_env[0])  # Appends Dict
-            else:  # Single environment
-                # current_states_tensor is (1, state_dim)
-                # actions_batch will be List[List[int]] of length 1, e.g., [[[act1, act2]]]
-                # info_batch will be List[Dict] of length 1, e.g., [[{info_dict}]]
-                actions_batch, info_batch = self.student.act(current_states_tensor)
-                all_env_actions.append(actions_batch[0])  # Appends List[int] (actions for the single env)
-                all_env_info.append(info_batch[0])
-
-            student_selected_actions = all_env_actions  # Now correctly List[List[int]]
-            student_runtime_info = all_env_info  # Now correctly List[Dict]
+            # Student.act processes a batch.
+            # It returns actions_batch: List[List[int]], info_batch: List[Dict[str, any]]
+            student_selected_actions_batch, student_runtime_info_batch = self.student.act(current_states_tensor)
 
             # === MENTOR QUERYING ===
-            # This part should now work correctly as student_runtime_info[i] will be a Dict
             mentor_advice_list = [None] * self.env.num_envs
             for i in range(self.env.num_envs):
-                if student_runtime_info[i].get('should_query_mentor', False):  # This line was causing the error
+                if student_runtime_info_batch[i].get('should_query_mentor', False):
                     num_mentor_queries_this_rollout += 1
                     mentor_advice_list[i] = self._query_mentor(current_states_tensor[i].unsqueeze(0))
 
             # === ENVIRONMENT STEP ===
-            # Ensure student_selected_actions is List[List[int]] for env.step
-            # uncertainties: List[float], one per environment
-            uncertainties_for_step = [info.get('uncertainty', {}).get('total', 0.5) for info in student_runtime_info]
+            uncertainties_for_step = [info.get('uncertainty', {}).get('total', 0.5) for info in
+                                      student_runtime_info_batch]
 
             next_obs_np, rewards_np, terminated_np, truncated_np, infos_from_env = self.env.step(
-                student_selected_actions, uncertainties_for_step
-            )  # these are all np.arrays of shape (num_envs, ...) or List[Dict] for infos_from_env
+                student_selected_actions_batch, uncertainties_for_step
+                # student_selected_actions_batch is already List[List[int]]
+            )
 
             # Apply reward shaping
             shaped_rewards_np = np.zeros_like(rewards_np)
             for i in range(self.env.num_envs):
-                # reward_shaper.shape_reward expects single obs, action, reward, etc.
-                # Use primary action from student_selected_actions[i][0] for shaping.
-                primary_action_env_i = student_selected_actions[i][0] if student_selected_actions[i] else 0  # fallback
-
-                # Handle obs for shaping: next_obs_np[i] is the state *after* action
-                # For potential-based shaping, often the state *before* action and after action are used.
-                # The current shaper might use the resulting state (next_obs_np[i]).
+                primary_action_env_i = student_selected_actions_batch[i][0] if student_selected_actions_batch[i] else 0
                 shaped_rewards_np[i] = self.reward_shaper.shape_reward(
                     next_obs_np[i], primary_action_env_i, rewards_np[i],
-                    (terminated_np[i] or truncated_np[i]), infos_from_env[i]
+                    (terminated_np[i] or truncated_np[i]), infos_from_env[i], env_idx=i
                 )
 
             # === EXPERIENCE COLLECTION ===
-            # ExperienceCollector.add expects batch tensors or np arrays.
-            # current_states_tensor is (N_envs, StateDim)
-            # student_selected_actions is List[List[int]], needs to be np.array (N_envs, NumStudentActions) or (N_envs, 1) if primary
-            # For log_probs and values, need to run student model again on current_states_tensor
             with torch.no_grad():
                 student_outputs_for_collection = self.student(current_states_tensor)
 
-            primary_actions_for_logprob = torch.tensor([sel_acts[0] for sel_acts in student_selected_actions],
-                                                       dtype=torch.long, device=DEVICE)
+            # Ensure primary_actions_for_logprob are valid indices
+            primary_actions_list = []
+            for sel_acts in student_selected_actions_batch:
+                if sel_acts:  # Ensure list is not empty
+                    action_val = sel_acts[0]
+                    if not (0 <= action_val < self.env.num_actions):
+                        self.logger.log(
+                            f"Warning: Invalid primary action {action_val} for num_actions {self.env.num_actions}. Clamping.",
+                            level="WARN")
+                        action_val = np.clip(action_val, 0, self.env.num_actions - 1)
+                    primary_actions_list.append(action_val)
+                else:  # Fallback if no action selected (should not happen with current student.act)
+                    primary_actions_list.append(0)
 
+            primary_actions_for_logprob = torch.tensor(primary_actions_list, dtype=torch.long, device=DEVICE)
 
-
-            dist_for_logprob = Categorical(
-                logits=student_outputs_for_collection['primary_logits'])  # This is the failing line
+            dist_for_logprob = Categorical(logits=student_outputs_for_collection['primary_logits'])
             log_probs_for_collection = dist_for_logprob.log_prob(primary_actions_for_logprob)
-
-            values_for_collection = student_outputs_for_collection['value'].squeeze(-1)  # Ensure (N_envs,)
-
-            # Convert uncertainties to consistent format if student_runtime_info is List[Dict]
-            uncertainty_values_for_collection = [info.get('uncertainty', {}) for info in student_runtime_info]
+            values_for_collection = student_outputs_for_collection['value'].squeeze(-1)
+            uncertainty_values_for_collection = [info.get('uncertainty', {}) for info in student_runtime_info_batch]
 
             self.experience_collector.add(
-                state=current_states_tensor.cpu().numpy(),  # (N_envs, StateDim)
-                action=np.array([sel_acts[0] for sel_acts in student_selected_actions]),  # (N_envs,), primary actions
-                reward=shaped_rewards_np,  # (N_envs,)
-                next_state=next_obs_np,  # (N_envs, StateDim)
-                done=(terminated_np | truncated_np),  # (N_envs,)
-                log_prob=log_probs_for_collection,  # (N_envs,)
-                value=values_for_collection,  # (N_envs,)
-                uncertainty=uncertainty_values_for_collection,  # List[Dict] or Dict
-                mentor_advice=mentor_advice_list  # List[MentorAdvice or None]
+                state=current_states_tensor.cpu().numpy(),
+                action=np.array([acts[0] if acts else 0 for acts in student_selected_actions_batch]),
+                # Store primary action
+                reward=shaped_rewards_np,
+                next_state=next_obs_np,
+                done=(terminated_np | truncated_np),
+                log_prob=log_probs_for_collection,
+                value=values_for_collection,
+                uncertainty=uncertainty_values_for_collection,
+                mentor_advice=mentor_advice_list
             )
 
             # === STATE UPDATE ===
-            current_states_tensor = self.env.get_state_tensor(next_obs_np)  # For next iteration
+            current_states_tensor = self.env.get_state_tensor(next_obs_np)
 
-            # Track episode completions from infos_from_env
             for i in range(self.env.num_envs):
-                if infos_from_env[i].get('episode_reward') is not None:
+                if infos_from_env[i].get('episode_reward') is not None:  # Check if key exists from gym wrapper
                     rollout_episode_rewards.append(infos_from_env[i]['episode_reward'])
+                    self.episode_count += 1
+                elif (terminated_np[i] or truncated_np[i]) and 'episode' in infos_from_env[i] and infos_from_env[i][
+                    'episode'] is not None:  # Standard gym final info
+                    rollout_episode_rewards.append(infos_from_env[i]['episode']['r'])
                     self.episode_count += 1
 
             self.timestep += self.env.num_envs
 
+        batch_data_collected = self.experience_collector.get_batch_tensors()
         return {
             'rollout_rewards': rollout_episode_rewards,
             'mentor_queries': num_mentor_queries_this_rollout,
-            'batch_data': self.experience_collector.get_batch_tensors()  # This converts collected lists to tensors
+            'batch_data': batch_data_collected
         }
 
     def _collect_experience_step(self, states: torch.Tensor, actions: List[List[int]],
@@ -884,14 +878,17 @@ class EnhancedRevolutionaryPipeline:
             episode_mentor_queries = 0
             # episode_pathway_activations = []
 
-            done = False
-            truncated_episode = False
-            while not (done or truncated_episode):
+            done_flag = False  # Gymnasium uses 'terminated' and 'truncated'
+            terminated_flag = False
+            truncated_flag = False
+
+            while not (terminated_flag or truncated_flag):
                 state_tensor_eval = eval_env.get_state_tensor(obs_np)  # Converts to (1, state_dim)
 
                 # Student action (deterministic for eval)
-                actions_list_eval, info_eval = self.student.act(state_tensor_eval, deterministic=True)
-                action_to_take_eval = actions_list_eval[0]  # Primary action for single env step
+                actions_list_eval_batch, info_eval_batch = self.student.act(state_tensor_eval, deterministic=True)
+                action_to_take_eval_list = actions_list_eval_batch[0]  # Primary action list for single env step
+                info_eval = info_eval_batch[0]  # Info dict for the single env
 
                 if info_eval.get('should_query_mentor', False):
                     episode_mentor_queries += 1
@@ -905,13 +902,17 @@ class EnhancedRevolutionaryPipeline:
 
                 # Environment step with the chosen primary action
                 # Eval env expects List[List[int]] for actions
-                next_obs_np, reward_eval, done, truncated_episode, _ = eval_env.step(
-                    [[action_to_take_eval]],
+                next_obs_np_batch, reward_eval_batch, terminated_batch, truncated_batch, info_env_batch = eval_env.step(
+                    [action_to_take_eval_list],  # Action list for the single env, wrapped in another list for batch
                     [info_eval.get('uncertainty', {}).get('total', 0.5)]
                 )
-                obs_np = next_obs_np  # Update obs for next step
 
-                episode_reward += reward_eval[0]  # reward_eval is np.array([float])
+                obs_np = next_obs_np_batch[0]  # Update obs for next step (index 0 for single env)
+                reward_eval = reward_eval_batch[0]
+                terminated_flag = terminated_batch[0]
+                truncated_flag = truncated_batch[0]
+
+                episode_reward += reward_eval
                 episode_length += 1
 
             eval_rewards_all_eps.append(episode_reward)
@@ -928,9 +929,9 @@ class EnhancedRevolutionaryPipeline:
             'eval_length_mean': np.mean(eval_lengths_all_eps) if eval_lengths_all_eps else 0.0,
             'eval_mentor_queries_mean': np.mean(eval_mentor_queries_all_eps) if eval_mentor_queries_all_eps else 0.0,
             'current_training_phase_at_eval': self.phase_transitions.get(self.training_phase, -1)
+            # Ensure training_phase is valid key
             # Log phase numerically
         }
-
         # Pathway consistency analysis (if data collected)
         # if pathway_activations_all_eps and self.critical_signatures:
         #     # This analysis needs careful implementation, potentially averaging over episodes/steps
@@ -957,17 +958,21 @@ class EnhancedRevolutionaryPipeline:
             student_pathway_patterns_over_time = []
             for student_batch_activations in pathway_activations_list_of_dicts:
                 # Extract raw activations for this signature's pathway from student_batch_activations
+                if not student_batch_activations: continue  # Skip if no activations for this step
                 current_raw_pathway_acts = self.focused_distillation_loss._extract_activations_for_signature(
                     student_batch_activations, signature
                 )  # (Batch, Num_Pathway_Neurons)
 
                 if current_raw_pathway_acts.numel() > 0:
-                    # Compress to match signature.activation_pattern's dimension
+                    # Compress to match signature.activation_pattern dimensions
                     # Take mean over batch if exists, then compress
-                    if current_raw_pathway_acts.dim() > 1:
+                    if current_raw_pathway_acts.dim() > 1 and current_raw_pathway_acts.shape[
+                        0] > 0:  # Check batch dim exists and >0
                         mean_batch_acts = current_raw_pathway_acts.mean(dim=0)
-                    else:
+                    elif current_raw_pathway_acts.dim() == 1:  # Already 1D (e.g. batch size 1 was squeezed or single feature)
                         mean_batch_acts = current_raw_pathway_acts
+                    else:  # Empty or scalar, cannot compress meaningfully
+                        continue
 
                     target_dim = signature.activation_pattern.shape[0]
                     compressed_pattern = self.focused_distillation_loss._compress_to_signature_space(
@@ -981,9 +986,13 @@ class EnhancedRevolutionaryPipeline:
                 # Higher value means more consistent (closer to the mean pattern, or less variance)
                 mean_pattern = patterns_tensor.mean(dim=0)
                 # Cosine similarity to the mean pattern
-                similarity_to_mean = F.cosine_similarity(patterns_tensor, mean_pattern.unsqueeze(0),
-                                                         dim=1).mean().item()
-                consistencies_per_signature.append(max(0.0, similarity_to_mean))
+                # Ensure mean_pattern is not zero vector for cosine similarity
+                if torch.norm(mean_pattern) > 1e-6 and torch.norm(patterns_tensor, dim=1).min() > 1e-6:
+                    similarity_to_mean = F.cosine_similarity(patterns_tensor, mean_pattern.unsqueeze(0),
+                                                             dim=1).mean().item()
+                    consistencies_per_signature.append(max(0.0, similarity_to_mean))
+                else:
+                    consistencies_per_signature.append(0.0)  # If patterns are zero, consistency is low or undefined
 
         return np.mean(consistencies_per_signature) if consistencies_per_signature else 0.0
 
@@ -994,8 +1003,8 @@ class EnhancedRevolutionaryPipeline:
             log_value = value
             if isinstance(value, torch.Tensor):
                 log_value = value.item()
-            elif isinstance(value, np.ndarray):
-                log_value = value.item()  # Or np.mean(value) if it's an array from somewhere
+            elif isinstance(value, np.ndarray):  # Handle numpy arrays if they appear
+                log_value = value.item() if value.size == 1 else np.mean(value)
 
             if isinstance(log_value, (float, int)):
                 self.logger.log_step(self.timestep, {
@@ -1014,20 +1023,33 @@ class EnhancedRevolutionaryPipeline:
 
         # Try to get a recent loss if available for logging
         recent_total_loss = 0
-        if 'losses' in self.logger.metrics_history and 'total_loss' in self.logger.metrics_history['losses']:
-            if self.logger.metrics_history['losses']['total_loss']:
+        current_phase_total_loss_key = f"{self.training_phase}_total_loss"
+        current_phase_rl_loss_key = f"{self.training_phase}_rl_total_rl"  # from focused training
+        current_phase_standard_total_loss_key = "total_loss"  # from standard training (distillation trainer)
+
+        if current_phase_total_loss_key in stats:
+            recent_total_loss = stats[current_phase_total_loss_key]
+        elif current_phase_rl_loss_key in stats:
+            recent_total_loss = stats[current_phase_rl_loss_key]
+        elif current_phase_standard_total_loss_key in stats:  # Fallback for standard training phase if not prefixed
+            recent_total_loss = stats[current_phase_standard_total_loss_key]
+        elif 'losses' in self.logger.metrics_history:  # Raw from history if not in stats
+            for loss_key_suffix in ['total_loss', 'total_focused', 'total_rl']:
+                loss_name = f"{self.training_phase}_{loss_key_suffix}"
+                if loss_name in self.logger.metrics_history['losses'] and self.logger.metrics_history['losses'][
+                    loss_name]:
+                    recent_total_loss = self.logger.metrics_history['losses'][loss_name][-1]
+                    break
+            if recent_total_loss == 0 and 'total_loss' in self.logger.metrics_history['losses'] and \
+                    self.logger.metrics_history['losses']['total_loss']:  # For standard mode
                 recent_total_loss = self.logger.metrics_history['losses']['total_loss'][-1]
-        elif f"{self.training_phase}_total_loss" in stats:  # Check if it's in averaged stats
-            recent_total_loss = stats[f"{self.training_phase}_total_loss"]
-        elif f"{self.training_phase}_rl_total_rl" in stats:  # Check for specific phase loss
-            recent_total_loss = stats[f"{self.training_phase}_rl_total_rl"]
 
         self.logger.log(
             f"Phase: {self.training_phase} | "
             f"TS: {self.timestep:,} | Ep: {self.episode_count:,} | "
             f"Rew (100): {stats.get('avg_reward_100', 0):.2f} | "
             f"Best Rew: {self.best_reward:.2f} | "
-            # f"Avg Loss: {recent_total_loss:.3e} | " # Can be noisy
+            f"Avg Loss: {recent_total_loss:.3e} | "  # Can be noisy
             f"CritSigs: {len(self.critical_signatures) if self.critical_signatures else 0} | "
             f"Time: {elapsed_time:.1f}s"
         )
@@ -1044,9 +1066,14 @@ class EnhancedRevolutionaryPipeline:
             'student': self.student.state_dict(),
         }
         optimizers_state = {
-            'student': self.student.optimizer.state_dict(),
-            'mentor': self.mentor.optimizer.state_dict(),
+            # Ensure optimizers exist before trying to save state_dict
+            'student': self.student.optimizer.state_dict() if hasattr(self.student,
+                                                                      'optimizer') and self.student.optimizer else None,
+            'mentor': self.mentor.optimizer.state_dict() if hasattr(self.mentor,
+                                                                    'optimizer') and self.mentor.optimizer else None,
         }
+        # Filter out None optimizer states
+        optimizers_state = {k: v for k, v in optimizers_state.items() if v is not None}
 
         # Save additional activation-based data
         # Ensure critical_signatures are serializable (dataclasses are fine with pickle)
@@ -1056,8 +1083,10 @@ class EnhancedRevolutionaryPipeline:
             pathway_analyzer_state_to_save = {
                 'model_structure': self.pathway_analyzer.model_structure,
                 # activation_graph is nx.Graph, picklable by default
-                'activation_graph': self.pathway_analyzer.activation_graph,
-                'pathway_importance': self.pathway_analyzer.pathway_importance,  # If still used
+                'activation_graph': self.pathway_analyzer.activation_graph if hasattr(self.pathway_analyzer,
+                                                                                      'activation_graph') else None,
+                'pathway_importance': self.pathway_analyzer.pathway_importance if hasattr(self.pathway_analyzer,
+                                                                                          'pathway_importance') else {},
             }
 
         additional_data = {
@@ -1068,21 +1097,18 @@ class EnhancedRevolutionaryPipeline:
             'episode_count': self.episode_count
         }
 
-        # Use logger's save_checkpoint for models and optimizers
-        # self.logger.save_checkpoint(models_state, optimizers_state, self.timestep)
-        # The logger method expects nn.Module and optim.Optimizer objects, not state_dicts
-        # Let's adapt or save separately. For now, save combined.
-
         checkpoint_path = os.path.join(self.logger.log_dir, f'checkpoint_{self.timestep}.pt')
-        torch.save({
-            'timestep': self.timestep,
-            'metrics_history': self.logger.metrics_history,  # Logger might save this itself too
-            'models_state_dict': models_state,
-            'optimizers_state_dict': optimizers_state,
-            'additional_pipeline_data': additional_data
-        }, checkpoint_path)
-
-        self.logger.log(f"Saved full pipeline checkpoint at timestep {self.timestep} to {checkpoint_path}")
+        try:
+            torch.save({
+                'timestep': self.timestep,
+                'metrics_history': self.logger.metrics_history,
+                'models_state_dict': models_state,
+                'optimizers_state_dict': optimizers_state,
+                'additional_pipeline_data': additional_data
+            }, checkpoint_path)
+            self.logger.log(f"Saved full pipeline checkpoint at timestep {self.timestep} to {checkpoint_path}")
+        except Exception as e:
+            self.logger.log(f"Error saving checkpoint: {e}", level="ERROR")
 
     def _final_evaluation(self):
         """Enhanced final evaluation"""
@@ -1135,40 +1161,70 @@ def main():
     # Override ENV_CONFIG['name'] if arg is provided
     if args.env_name:
         ENV_CONFIG['name'] = args.env_name
-        print(f"Overriding environment name to: {args.env_name}")
+        # print(f"Overriding environment name to: {args.env_name}") # Logger will handle this
 
     # Set random seeds for reproducibility
     torch.manual_seed(SEED)
     np.random.seed(SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)  # For multi-GPU
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
+        # Disabling deterministic and benchmark flags as they can sometimes cause issues
+        # or hide other problems, and often not strictly necessary unless specific
+        # reproducibility is paramount over performance.
+        # torch.backends.cudnn.deterministic = True
+        # torch.backends.cudnn.benchmark = False
 
     # Create and run enhanced pipeline
     pipeline = EnhancedRevolutionaryPipeline(args)
+    pipeline.logger.log(f"Overriding environment name to: {ENV_CONFIG['name']}")
 
     if args.load_checkpoint:
-        # TODO: Implement enhanced checkpoint loading logic
-        # This would involve loading model state_dicts, optimizer state_dicts,
-        # and potentially other training states like timestep, critical_signatures, etc.
-        pipeline.logger.log(f"Loading checkpoint from: {args.load_checkpoint} (Full loading logic TBD)")
+        pipeline.logger.log(f"Attempting to load checkpoint from: {args.load_checkpoint}")
         try:
             checkpoint = torch.load(args.load_checkpoint, map_location=DEVICE)
-            pipeline.mentor.load_state_dict(checkpoint['models_state_dict']['mentor'])
-            pipeline.student.load_state_dict(checkpoint['models_state_dict']['student'])
-            pipeline.mentor.optimizer.load_state_dict(checkpoint['optimizers_state_dict']['mentor'])
-            pipeline.student.optimizer.load_state_dict(checkpoint['optimizers_state_dict']['student'])
+
+            # Load models
+            if 'models_state_dict' in checkpoint:
+                if 'mentor' in checkpoint['models_state_dict']:
+                    pipeline.mentor.load_state_dict(checkpoint['models_state_dict']['mentor'])
+                if 'student' in checkpoint['models_state_dict']:
+                    pipeline.student.load_state_dict(checkpoint['models_state_dict']['student'])
+
+            # Load optimizers if they exist and states are available
+            if 'optimizers_state_dict' in checkpoint:
+                if hasattr(pipeline.mentor, 'optimizer') and pipeline.mentor.optimizer and 'mentor' in checkpoint[
+                    'optimizers_state_dict']:
+                    if checkpoint['optimizers_state_dict']['mentor'] is not None:
+                        pipeline.mentor.optimizer.load_state_dict(checkpoint['optimizers_state_dict']['mentor'])
+                if hasattr(pipeline.student, 'optimizer') and pipeline.student.optimizer and 'student' in checkpoint[
+                    'optimizers_state_dict']:
+                    if checkpoint['optimizers_state_dict']['student'] is not None:
+                        pipeline.student.optimizer.load_state_dict(checkpoint['optimizers_state_dict']['student'])
+
             pipeline.timestep = checkpoint.get('timestep', 0)
-            pipeline.episode_count = checkpoint.get('additional_pipeline_data', {}).get('episode_count', 0)
-            pipeline.best_reward = checkpoint.get('additional_pipeline_data', {}).get('best_reward', float('-inf'))
-            pipeline.critical_signatures = checkpoint.get('additional_pipeline_data', {}).get('critical_signatures', [])
-            # Consider how to restore logger's metrics_history for plotting continuity
+
+            additional_data = checkpoint.get('additional_pipeline_data', {})
+            pipeline.episode_count = additional_data.get('episode_count', 0)
+            pipeline.best_reward = additional_data.get('best_reward', float('-inf'))
+            pipeline.critical_signatures = additional_data.get('critical_signatures', [])
+            pipeline.training_phase = additional_data.get('training_phase',
+                                                          'human_cloning')  # Default to start if not saved
+
+            # Restore pathway analyzer state if available
+            saved_pa_state = additional_data.get('pathway_analyzer_state')
+            if saved_pa_state and pipeline.pathway_analyzer:
+                pipeline.pathway_analyzer.model_structure = saved_pa_state.get('model_structure', {})
+                pipeline.pathway_analyzer.activation_graph = saved_pa_state.get('activation_graph', None)
+                pipeline.pathway_analyzer.pathway_importance = saved_pa_state.get('pathway_importance', {})
+
             pipeline.logger.metrics_history = checkpoint.get('metrics_history', pipeline.logger.metrics_history)
             pipeline.logger.log(f"Checkpoint loaded successfully from timestep {pipeline.timestep}.")
 
         except Exception as e:
             pipeline.logger.log(f"Failed to load checkpoint: {e}", level="ERROR")
+            import traceback
+            pipeline.logger.log(traceback.format_exc(), level="ERROR")  # Log full traceback
+            return  # Exit if checkpoint loading fails catastrophically
 
     if args.eval_only:
         if not args.load_checkpoint:
